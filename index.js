@@ -30,7 +30,22 @@ const defaultSettings = Object.freeze({
     snippetsPerLayer: 30,
     snippetsPerPromotion: 3,
     maxLayers: 5,
-    injectionTemplate: '\n\n<summary>\n{{summary}}\n</summary>\n\n',
+
+    // Summary trigger gate (token-based, on top of the verbatimTurns check).
+    // 0 = disabled: summaries trigger when visible assistant turns > verbatimTurns.
+    // >0: BOTH must be true — visible turns > verbatimTurns AND visible tokens >= threshold.
+    //      When fired, runs a bulk catch-up (like Force Summarize Now), not a single batch.
+    contextThresholdTokens: 0,
+    injectionTemplate: 'This is a summary of the events so far. Every turn before the continuation is summarized here for token economy. Everything in the summary was role-played in this role-play and happened after time-zero.\n\n<summary>\n{{summary}}\n</summary>\n\nDirectly continue from the last state in the summary.',
+
+    // Role of the injected summary message (depth-0 path only): 0=system, 1=user, 2=assistant.
+    injectionRole: 1,
+
+    // When true, summaries are auto-injected at depth-0 via setExtensionPrompt
+    // (legacy behavior). When false, the summary is only available via the
+    // {{sum}} macro, which the user places anywhere in their preset / character
+    // card / world info. Macro always works regardless of this toggle.
+    autoInjectSummary: true,
 
     summarizerSystemPrompt:
         'Role: precise narrative-state tracker. Output only the summary line — no preamble, no commentary, no markdown.',
@@ -56,11 +71,16 @@ Exclude anything insubstantial, fluff, atmospheric details, or events already co
 
 Write in short phrases, no more than 20; output must be a single line:`,
 
-    promptPreset: 'narrative',  // 'narrative' | 'gamestate' | 'custom'
+    promptPreset: 'narrative',  // 'narrative' | 'gamestate' | 'detailed' | 'custom'
     savedCustomPrompts: {},        // { name: promptText } — named custom prompt slots
     lastCustomPrompt: '',          // Auto-saved when switching away from custom
     pauseSummarization: false,  // true = stop processing, keep injecting
     disableGhosting: false,  // true = mark as summarized but don't hide messages
+
+    // ─── Disable behavior ─────────────────────────────────────────
+    // When true, toggling Enable OFF automatically unhides all SC-ghosted
+    // messages for the current chat (non-destructive; memory store preserved).
+    autoUnghostOnDisable: true,
 
     stripPatterns: [
         '<|channel>thought',
@@ -84,7 +104,7 @@ Write in short phrases, no more than 20; output must be a single line:`,
     openaiUrl: '',
     openaiKey: '',
     openaiModel: '',
-    openaiMaxTokens: 0,                   // 0 = no limit (provider default)
+    openaiMaxTokens: 32768,              // High default — reasoning models need room to think
 });
 
 // ─── Prompt Presets ──────────────────────────────────────────────────
@@ -129,6 +149,30 @@ Focus on: story progression, plot points, plans, tasks, quests; location changes
 Exclude anything insubstantial, fluff, atmospheric details, or events already covered in Prior Context.
 Skip any passages that are empty, unclear, or lack significant content.
 Write in short phrases, no more than 20; output must be a single line:`,
+
+    detailed: `<player_name>
+{{player_name}}
+</player_name>
+
+<prior_context>
+{{context_str}}
+</prior_context>
+
+<passage_in_question>
+{{story_txt}}
+</passage_in_question>
+
+Summarize the passage_in_question to coherently continue the prior_context. If the passage_in_question has 2nd person point of view, 'you' pronoun in prose refers to the player. Use the player name in the summary output instead of 'you'.
+
+Preserve every meaningful beat — do not omit anything that could matter later. Write as continuous narrative in the same tense and person as the prior_context, NOT as analysis. Capture in the prose itself:
+
+- What characters say, do, and how they respond to each other
+- Emotional tone and shifting attitudes, shown through behavior and wording, not labeled or diagnosed
+- Sensory details, atmosphere, mood, significant wording
+- Exact names, locations, items, time markers
+- What is left unresolved or hanging
+
+Exclude only events already covered in the prior_context. Be specific, not flowery. Multiple paragraphs are permitted as needed. Do NOT add meta-commentary, narrative status reports, or analytical observations about the scene. Do NOT restate information already covered in an earlier paragraph. Maintain chronological order.`,
 
     custom: null, // Uses whatever is in the textarea
 };
@@ -264,11 +308,16 @@ function getChatStore() {
             layers: [],
             summarizedUpTo: -1,
             ghostedIndices: [],           // Track which messages WE ghosted
+            thresholdMet: false,          // One-time gate: once contextThresholdTokens is met, stop checking
         };
     }
     // Migration: add ghostedIndices if missing from older saves
     if (!chatMetadata[MODULE_NAME].ghostedIndices) {
         chatMetadata[MODULE_NAME].ghostedIndices = [];
+    }
+    // Migration: add thresholdMet if missing from older saves
+    if (!Object.hasOwn(chatMetadata[MODULE_NAME], 'thresholdMet')) {
+        chatMetadata[MODULE_NAME].thresholdMet = false;
     }
     return chatMetadata[MODULE_NAME];
 }
@@ -634,26 +683,82 @@ function buildFullContext(downToLayer = 0) {
     return parts.length > 0 ? parts.join(' ') : '(none yet)';
 }
 
+/**
+ * Approximate the token cost of all LLM-visible messages in the current chat.
+ * Excludes messages hidden by the user or ghosted by Summaryception (via /hide).
+ * Used by the context-threshold trigger; just a rough proxy — does not include
+ * system prompts, world info, persona, or other injected context.
+ *
+ * @param {Array} chat - SillyTavern chat array
+ * @returns {number} - estimated token count of visible messages
+ */
+function computeVisibleTokens(chat) {
+    if (!chat || chat.length === 0) return 0;
+    const { getTokenCount } = SillyTavern.getContext();
+    if (typeof getTokenCount !== 'function') return 0;
+
+    let total = 0;
+    for (let i = 0; i < chat.length; i++) {
+        const m = chat[i];
+        if (!m) continue;
+        // Hidden messages (by /hide — user or SC-ghosted) are excluded from LLM context
+        if (m.is_hidden) continue;
+        if (m.extra?.sc_ghosted) continue;
+        const text = m.mes || '';
+        if (!text.trim()) continue;
+        // Prefer cached token_count if ST populated it
+        if (typeof m.token_count === 'number' && m.token_count > 0) {
+            total += m.token_count;
+        } else {
+            total += getTokenCount(text, m.is_user ? 1 : 2);
+        }
+    }
+    return total;
+}
+
 // ─── Prompt Toggle Management ────────────────────────────────────────
+
+/**
+ * Get the prompt order list for the active character.
+ * ST's API is `getPromptOrderForCharacter(character)` — there is no
+ * `getPromptOrderEntries()`. Returns the live order array (mutating
+ * `entry.enabled` on its items propagates to generation), or null.
+ */
+function getLivePromptOrder() {
+    try {
+        const ctx = SillyTavern.getContext();
+        const promptManager = ctx.promptManager;
+        if (!promptManager) return null;
+        // Prefer the public method when available (forward-compat).
+        if (typeof promptManager.getPromptOrderForCharacter === 'function' && promptManager.activeCharacter) {
+            const order = promptManager.getPromptOrderForCharacter(promptManager.activeCharacter);
+            if (Array.isArray(order)) return order;
+        }
+        // Direct fallback for ST versions where activeCharacter isn't set yet.
+        const dummyId = promptManager.configuration?.promptOrder?.dummyId ?? 100000;
+        const orders = promptManager.serviceSettings?.prompt_order;
+        if (Array.isArray(orders)) {
+            const found = orders.find(o => String(o.character_id) === String(dummyId));
+            if (Array.isArray(found?.order)) return found.order;
+        }
+        return null;
+    } catch (e) {
+        log('getLivePromptOrder error:', e);
+        return null;
+    }
+}
 
 function snapshotPromptToggles() {
     const snapshot = new Map();
     try {
-        const ctx = SillyTavern.getContext();
-        const promptManager = ctx.promptManager;
-        if (!promptManager) {
-            log('No prompt manager available, skipping toggle snapshot.');
+        const orderList = getLivePromptOrder();
+        if (!orderList) {
+            log('No prompt order list available, skipping toggle snapshot.');
             return snapshot;
         }
-        const collection = promptManager.getPromptCollection();
-        if (!collection?.collection) return snapshot;
-        const orderList = promptManager.getPromptOrderEntries();
-        if (!orderList) return snapshot;
-        for (const entry of collection.collection) {
-            for (const orderEntry of orderList) {
-                if (orderEntry.identifier === entry.identifier) {
-                    snapshot.set(entry.identifier, orderEntry.enabled);
-                }
+        for (const orderEntry of orderList) {
+            if (orderEntry?.identifier != null) {
+                snapshot.set(orderEntry.identifier, !!orderEntry.enabled);
             }
         }
         log(`Snapshot captured: ${snapshot.size} prompt toggles`);
@@ -665,14 +770,11 @@ function snapshotPromptToggles() {
 
 function disableAllPromptToggles() {
     try {
-        const ctx = SillyTavern.getContext();
-        const promptManager = ctx.promptManager;
-        if (!promptManager) return;
-        const orderList = promptManager.getPromptOrderEntries();
+        const orderList = getLivePromptOrder();
         if (!orderList) return;
         let count = 0;
         for (const entry of orderList) {
-            if (entry.enabled) {
+            if (entry?.enabled) {
                 entry.enabled = false;
                 count++;
             }
@@ -686,14 +788,11 @@ function disableAllPromptToggles() {
 function restorePromptToggles(snapshot) {
     if (!snapshot || snapshot.size === 0) return;
     try {
-        const ctx = SillyTavern.getContext();
-        const promptManager = ctx.promptManager;
-        if (!promptManager) return;
-        const orderList = promptManager.getPromptOrderEntries();
+        const orderList = getLivePromptOrder();
         if (!orderList) return;
         let count = 0;
         for (const entry of orderList) {
-            if (snapshot.has(entry.identifier)) {
+            if (entry && snapshot.has(entry.identifier)) {
                 entry.enabled = snapshot.get(entry.identifier);
                 count++;
             }
@@ -936,6 +1035,29 @@ async function maybeSummarizeTurns() {
     if (visibleTurns.length <= s.verbatimTurns) return;
 
     const overflow = visibleTurns.length - s.verbatimTurns;
+
+    // ─── Context token threshold gate ─────────────────────────────
+    // When contextThresholdTokens > 0, the FIRST trigger requires BOTH:
+    //   1. Visible tokens >= threshold
+    //   2. Visible turns  >  verbatimTurns (already verified above)
+    // Once the threshold is met for the first time (thresholdMet flag in
+    // chat store), subsequent triggers only check the turn count — the
+    // threshold is a one-time initial gate, not a recurring one.
+    // When fired, run a bulk catch-up (like Force Summarize Now) down to the
+    // verbatim limit, skipping the backlog dialog.
+    if (s.contextThresholdTokens > 0 && !store.thresholdMet) {
+        const visibleTokens = computeVisibleTokens(chat);
+        log(`Threshold gate: ${visibleTokens}/${s.contextThresholdTokens} tokens, overflow=${overflow} turns`);
+
+        if (visibleTokens < s.contextThresholdTokens) {
+            return; // not enough context yet — let it grow
+        }
+
+        // Threshold met for the first time — latch it permanently
+        store.thresholdMet = true;
+        await saveChatStore();
+        log('Token threshold met for the first time — latching. Future triggers will only check turn count.');
+    }
 
     // ─── Backlog detection ───────────────────────────────────────
     const backlogThreshold = s.turnsPerSummary * 2;
@@ -1497,30 +1619,93 @@ function assembleSummaryBlock() {
     return s.injectionTemplate.replace('{{summary}}', snippets.join(' '));
 }
 
-// ─── Injection via setExtensionPrompt ────────────────────────────────
+// ─── Injection: {{sum}} macro + optional depth-0 extension_prompt ────
 
-let _lastInjected = '';
+let _lastInjected = '';  // tracks depth-0 extension_prompt content (for clean teardown)
+let _macroRegistered = false;
 
+/**
+ * Register the {{sum}} macro with SillyTavern.
+ * Placing {{sum}} in any field that goes through macro substitution
+ * (preset entries, character cards, world info, scenario, etc.) will be
+ * replaced with the assembled summary block at generation time.
+ *
+ * The handler is synchronous (ST requirement) and reads live state on every
+ * call — so previewing, regenerating, or swapping chats always reflects
+ * the current summary content.
+ *
+ * Supports both the new `macros.register()` API (preferred) and the
+ * deprecated `registerMacro()` fallback for older ST versions.
+ */
+function registerSumMacro() {
+    if (_macroRegistered) return;
+    try {
+        const ctx = SillyTavern.getContext();
+
+        const handler = () => {
+            try {
+                const s = getSettings();
+                if (!s.enabled) return '';
+                return assembleSummaryBlock() || '';
+            } catch (e) {
+                log('{{sum}} macro handler error:', e);
+                return '';
+            }
+        };
+
+        // Preferred: new macros API (ST 1.16+)
+        if (ctx.macros?.register) {
+            ctx.macros.register('sum', {
+                description: 'Summaryception — injects the assembled summary block (layers + snippets wrapped in the injection template). Place this anywhere in your preset / character card / world info.',
+                handler,
+            });
+            _macroRegistered = true;
+            log('{{sum}} macro registered (new API).');
+            return;
+        }
+
+        // Fallback: deprecated registerMacro(name, callbackOrString)
+        if (typeof ctx.registerMacro === 'function') {
+            ctx.registerMacro('sum', handler);
+            _macroRegistered = true;
+            log('{{sum}} macro registered (legacy API).');
+            return;
+        }
+
+        console.warn(LOG_PREFIX, 'No macro registration API available — {{sum}} will not work. Update SillyTavern.');
+    } catch (e) {
+        console.error(LOG_PREFIX, 'Failed to register {{sum}} macro:', e);
+    }
+}
+
+/**
+ * Update the depth-0 extension_prompt injection (legacy fallback path).
+ * The {{sum}} macro is independent of this — it always works regardless.
+ *
+ * When `autoInjectSummary` is true, we set the depth-0 extension_prompt to the
+ * current summary block. When false (or SC is disabled), we clear it.
+ *
+ * The handler stays lightweight — only writes when content actually changes,
+ * to avoid spamming the prompt manager on every render.
+ */
 function updateInjection() {
     try {
         const { setExtensionPrompt } = SillyTavern.getContext();
         const s = getSettings();
 
-        if (!s.enabled) {
-            if (_lastInjected !== '') {
-                setExtensionPrompt(MODULE_NAME, '', 0, 0, false, 0);
-                _lastInjected = '';
-            }
-            return;
+        const desired = (s.enabled && s.autoInjectSummary) ? (assembleSummaryBlock() || '') : '';
+
+        if (desired === _lastInjected) return;
+
+        if (desired) {
+            setExtensionPrompt(MODULE_NAME, desired, 0, 0, false, s.injectionRole);
+            log(`Depth-0 injection updated: ${desired.length} chars`);
+        } else {
+            // Clear whatever we previously injected
+            setExtensionPrompt(MODULE_NAME, '', 0, 0, false, 0);
+            log('Depth-0 injection cleared.');
         }
-
-        const summaryBlock = assembleSummaryBlock();
-        if (summaryBlock === _lastInjected) return;
-
-        setExtensionPrompt(MODULE_NAME, summaryBlock || '', 0, 0, false, 0);
-        _lastInjected = summaryBlock || '';
-
-        log(`Injection updated: ${(summaryBlock || '').length} chars`);
+        _lastInjected = desired;
     } catch (e) {
         log('updateInjection error:', e);
     }
@@ -1548,6 +1733,9 @@ function onMessageReceived(messageIndex) {
 function onChatChanged() {
     log('Chat changed.');
     catchupDismissed = false;
+    // Clear the depth-0 injection cache so cross-chat identical summaries don't get skipped.
+    // (The {{sum}} macro reads live state, so it always reflects the current chat.)
+    _lastInjected = '';
     setTimeout(async () => {
         await repairIfBranched();
         updateInjection();
@@ -1600,9 +1788,7 @@ function registerSlashCommands() {
                 store.layers.length = 0;
                 store.summarizedUpTo = -1;
                 store.ghostedIndices = [];
-
-                const { chatMetadata } = SillyTavern.getContext();
-                chatMetadata[MODULE_NAME] = store;
+                store.thresholdMet = false;
 
                 await saveChatStore();
                 try {
@@ -1640,10 +1826,14 @@ function updateUI() {
         $('#sc_enabled').prop('checked', s.enabled);
         $('#sc_pause_summarization').prop('checked', s.pauseSummarization);
         $('#sc_disable_ghosting').prop('checked', s.disableGhosting);
+        $('#sc_auto_unghost').prop('checked', s.autoUnghostOnDisable);
+        $('#sc_auto_inject').prop('checked', s.autoInjectSummary);
+        $('#sc_injection_role').val(s.injectionRole);
         $('#sc_verbatim_turns').val(s.verbatimTurns);
         $('#sc_verbatim_turns_val').text(s.verbatimTurns);
         $('#sc_turns_per_summary').val(s.turnsPerSummary);
         $('#sc_turns_per_summary_val').text(s.turnsPerSummary);
+        $('#sc_context_threshold_tokens').val(s.contextThresholdTokens || 0);
         $('#sc_snippets_per_layer').val(s.snippetsPerLayer);
         $('#sc_snippets_per_layer_val').text(s.snippetsPerLayer);
         $('#sc_snippets_per_promotion').val(s.snippetsPerPromotion);
@@ -1708,6 +1898,18 @@ function updateUI() {
         }
 
         $('#sc_layer_stats').html(statsHtml);
+
+        // ── Injection status indicator ──
+        const roleLabel = s.injectionRole === 2 ? 'assistant' : (s.injectionRole === 1 ? 'user' : 'system');
+        let statusLine;
+        if (!s.enabled) {
+            statusLine = '→ disabled';
+        } else if (s.autoInjectSummary) {
+            statusLine = `→ {{sum}} macro + depth-0 auto-inject (role: ${roleLabel})`;
+        } else {
+            statusLine = '→ {{sum}} macro only (place it in your preset / card / world info)';
+        }
+        $('#sc_injection_target').text(statusLine);
 
         const preview = assembleSummaryBlock();
         $('#sc_preview').val(preview || '(empty — no summaries yet)');
@@ -1942,10 +2144,75 @@ function escapeHtml(text) {
 }
 
 function bindUIEvents() {
-    $(document).on('change', '#sc_enabled', function () {
-        getSettings().enabled = $(this).prop('checked');
+    $(document).on('change', '#sc_enabled', async function () {
+        const s = getSettings();
+        s.enabled = $(this).prop('checked');
         saveSettings();
+
+        if (!s.enabled && s.autoUnghostOnDisable) {
+            // Non-destructively restore SC-hidden messages so the LLM sees them again.
+            try {
+                await unghostAllMessages();
+                toastr.info(
+                    'Summaryception disabled. All hidden messages have been restored.',
+                    'Summaryception',
+                    { timeOut: 4000 }
+                );
+            } catch (e) {
+                log('unghost on disable error:', e);
+                toastr.warning(
+                    'Summaryception disabled, but some messages could not be restored. Use "Restore Hidden".',
+                    'Summaryception'
+                );
+            }
+        }
+
         updateInjection();
+        updateUI();
+    });
+
+    $(document).on('change', '#sc_auto_unghost', function () {
+        getSettings().autoUnghostOnDisable = $(this).prop('checked');
+        saveSettings();
+    });
+
+    $(document).on('click', '#sc_restore_hidden', async function () {
+        try {
+            await unghostAllMessages();
+            toastr.success('Hidden messages restored', 'Summaryception', { timeOut: 3000 });
+        } catch (e) {
+            log('restore hidden error:', e);
+            toastr.error('Could not restore hidden messages', 'Summaryception');
+        }
+    });
+
+    $(document).on('change', '#sc_auto_inject', function () {
+        const s = getSettings();
+        s.autoInjectSummary = $(this).prop('checked');
+        saveSettings();
+        // Clear depth-0 cache so the toggle takes effect immediately.
+        try {
+            const { setExtensionPrompt } = SillyTavern.getContext();
+            if (setExtensionPrompt) setExtensionPrompt(MODULE_NAME, '', 0, 0, false, 0);
+        } catch (e) { /* ignore */ }
+        _lastInjected = '';
+        updateInjection();
+        updateUI();
+    });
+
+    $(document).on('change', '#sc_injection_role', function () {
+        const s = getSettings();
+        const v = parseInt($(this).val(), 10);
+        s.injectionRole = (v === 0 || v === 1 || v === 2) ? v : 1;
+        saveSettings();
+        // Clear the previous injection so the role change takes effect cleanly.
+        try {
+            const { setExtensionPrompt } = SillyTavern.getContext();
+            if (setExtensionPrompt) setExtensionPrompt(MODULE_NAME, '', 0, 0, false, 0);
+        } catch (e) { /* ignore */ }
+        _lastInjected = '';
+        updateInjection();
+        updateUI();
     });
 
     $(document).on('change', '#sc_pause_summarization', function () {
@@ -1986,6 +2253,12 @@ function bindUIEvents() {
         saveSettings();
     });
 
+    $(document).on('input', '#sc_context_threshold_tokens', function () {
+        const val = parseInt($(this).val(), 10);
+        getSettings().contextThresholdTokens = (Number.isFinite(val) && val >= 0) ? val : 0;
+        saveSettings();
+    });
+
     $(document).on('change', '#sc_strip_patterns', function () {
         const lines = $(this).val().split('\n').map(l => l.trim()).filter(l => l.length > 0);
         getSettings().stripPatterns = lines;
@@ -2001,12 +2274,21 @@ function bindUIEvents() {
     ];
 
     for (const sl of sliders) {
+        // Live label update on every pixel move (no save to avoid spamming debounce)
         $(document).on('input', sl.id, function () {
+            const val = parseInt($(this).val(), 10);
+            $(sl.display).text(val);
+        });
+
+        // Save + inject once on release (change fires when user lets go)
+        $(document).on('change', sl.id, async function () {
             const val = parseInt($(this).val(), 10);
             getSettings()[sl.key] = val;
             $(sl.display).text(val);
             saveSettings();
             updateInjection();
+            // Re-sync UI in case saveSettingsDebounced or events caused a desync
+            updateUI();
         });
     }
 
@@ -2105,6 +2387,7 @@ function bindUIEvents() {
         store.layers.length = 0;
         store.summarizedUpTo = -1;
         store.ghostedIndices = [];
+        store.thresholdMet = false;
 
         const { chatMetadata } = SillyTavern.getContext();
         chatMetadata[MODULE_NAME] = store;
@@ -2439,6 +2722,7 @@ function bindUIEvents() {
         s.snippetsPerLayer = defaultSettings.snippetsPerLayer;
         s.snippetsPerPromotion = defaultSettings.snippetsPerPromotion;
         s.maxLayers = defaultSettings.maxLayers;
+        s.contextThresholdTokens = defaultSettings.contextThresholdTokens;
 
         // Reset prompts
         s.summarizerSystemPrompt = defaultSettings.summarizerSystemPrompt;
@@ -2447,6 +2731,11 @@ function bindUIEvents() {
         s.injectionTemplate = defaultSettings.injectionTemplate;
         s.stripPatterns = [...defaultSettings.stripPatterns];
         s.summarizerResponseLength = defaultSettings.summarizerResponseLength;
+
+        // Reset injection + disable behavior
+        s.autoInjectSummary = defaultSettings.autoInjectSummary;
+        s.autoUnghostOnDisable = defaultSettings.autoUnghostOnDisable;
+        s.injectionRole = defaultSettings.injectionRole;
 
         // Reset debug
         s.debugMode = defaultSettings.debugMode;
@@ -2746,6 +3035,11 @@ async function fetchProfilesFallback(selectElement, currentValue) {
     bindUIEvents();
     initConnectionUI();
 
+    // Register the {{sum}} macro as early as possible so it's available
+    // for the first generation. APP_READY re-registers in case the macro
+    // API wasn't ready at load time.
+    registerSumMacro();
+
     eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
     eventSource.on(event_types.CHAT_CHANGED, onChatChanged);
     eventSource.on(event_types.GENERATION_STARTED, onGenerationStarted);
@@ -2753,8 +3047,9 @@ async function fetchProfilesFallback(selectElement, currentValue) {
     registerSlashCommands();
 
     eventSource.on(event_types.APP_READY, () => {
+        registerSumMacro();
         updateInjection();
         updateUI();
-        console.log(LOG_PREFIX, 'v5.5.3 loaded. Connection Settings available');
+        console.log(LOG_PREFIX, 'v5.5.3 loaded. {{sum}} macro + Connection Settings available');
     });
 })();

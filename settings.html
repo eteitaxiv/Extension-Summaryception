@@ -30,6 +30,13 @@
                 <small class="sc-hint">Messages will still be summarized and excluded from LLM context, but won't be visually hidden. Useful for compatibility with other extensions (QVink, MemoryBooks, etc.).</small>
             </label>
 
+            <!-- ═══ Auto-restore on disable ═══ -->
+            <label class="checkbox_label" for="sc_auto_unghost">
+                <input type="checkbox" id="sc_auto_unghost" />
+                <span>Restore Hidden Messages on Disable</span>
+                <small class="sc-hint">When unchecked, toggling Enable OFF only stops injection — ghosted messages stay hidden until restored manually.</small>
+            </label>
+
             <!-- ═══ Actions ═══ -->
             <div class="sc-button-row">
                 <button id="sc_force_summarize" class="menu_button">
@@ -40,6 +47,9 @@
                 </button>
                 <button id="sc_repair" class="menu_button">
                     <i class="fa-solid fa-wrench"></i> Repair Orphans
+                </button>
+                <button id="sc_restore_hidden" class="menu_button">
+                    <i class="fa-solid fa-eye"></i> Restore Hidden
                 </button>
             </div>
 
@@ -53,6 +63,7 @@
 
             <!-- ═══ Preview ═══ -->
             <h4 class="sc-section-title">👁️ Injection Preview</h4>
+            <div id="sc_injection_target" class="sc-layer-stat sc-muted" style="margin-bottom: 6px;"></div>
             <textarea id="sc_preview" class="text_pole sc-textarea sc-preview" rows="6" readonly></textarea>
             <div class="sc-button-row">
                 <button id="sc_refresh_preview" class="menu_button">
@@ -207,7 +218,7 @@
                                     <span>Max Tokens</span>
                                 </label>
                                 <input id="summaryception_openai_max_tokens" type="number" class="text_pole"
-                                       min="0" step="100" placeholder="0 = no limit (provider default)" />
+                                       min="0" step="100" placeholder="32768" value="32768" />
                             </div>
                             <div class="summaryception-setting-row">
                                 <div id="summaryception_openai_test"
@@ -242,10 +253,10 @@
                     <div class="sc-row">
                         <label for="sc_verbatim_turns">
                             <span>Verbatim Assistant Turns to Keep</span>
-                            <small class="sc-hint">Recent assistant turns sent word-for-word. Older ones are summarized.</small>
+                            <small class="sc-hint">Recent assistant turns sent word-for-word AND kept unhidden. Older ones are summarized + hidden.</small>
                         </label>
                         <div class="sc-slider-row">
-                            <input type="range" id="sc_verbatim_turns" min="1" max="50" step="1" />
+                            <input type="range" id="sc_verbatim_turns" min="1" max="200" step="1" />
                             <span id="sc_verbatim_turns_val" class="sc-val">10</span>
                         </div>
                     </div>
@@ -259,6 +270,18 @@
                             <input type="range" id="sc_turns_per_summary" min="1" max="20" step="1" />
                             <span id="sc_turns_per_summary_val" class="sc-val">3</span>
                         </div>
+                    </div>
+
+                    <div class="sc-row">
+                        <label for="sc_context_threshold_tokens">
+                            <span>Context Token Threshold</span>
+                            <small class="sc-hint">
+                                Don't summarize until visible chat exceeds this many tokens <em>and</em> visible turns exceed the verbatim limit.
+                                0 = disabled (use turn-count trigger only). When triggered, runs a bulk catch-up
+                                (like Force Summarize Now) down to the verbatim limit. E.g., <code>30000</code> = wait until ~30k tokens.
+                            </small>
+                        </label>
+                        <input id="sc_context_threshold_tokens" type="number" class="text_pole" min="0" step="500" placeholder="0 = disabled" />
                     </div>
 
                     <hr class="sc-divider" />
@@ -301,6 +324,38 @@
 
                     <hr class="sc-divider" />
 
+                    <!-- Injection -->
+                    <h4 class="sc-section-title">📥 Injection</h4>
+                    <div class="sc-row">
+                        <div class="sc-info-box">
+                            <p><strong>Place <code>{{sum}}</code> anywhere</strong> in your preset entries, character card, world info, scenario, or persona description to embed the summary at that position.</p>
+                            <p>The macro returns the assembled summary block (all layers, wrapped in the Injection Wrapper Template below).</p>
+                            <p>This always works regardless of the toggle below.</p>
+                        </div>
+                    </div>
+                    <div class="sc-row">
+                        <label class="checkbox_label" for="sc_auto_inject">
+                            <input type="checkbox" id="sc_auto_inject" />
+                            <span>Auto-inject at depth-0 (legacy)</span>
+                            <small class="sc-hint">
+                                When ON, summaries are also injected as a depth-0 message next to the latest turn (no <code>{{sum}}</code> placement needed). Turn OFF if you're placing <code>{{sum}}</code> manually — otherwise you'll get duplicate summaries.
+                            </small>
+                        </label>
+                    </div>
+                    <div class="sc-row">
+                        <label for="sc_injection_role">
+                            <span>Injection Role (depth-0 path)</span>
+                            <small class="sc-hint">Role of the injected depth-0 message. Only applies when Auto-inject is ON.</small>
+                        </label>
+                        <select id="sc_injection_role" class="text_pole">
+                            <option value="1">User</option>
+                            <option value="0">System</option>
+                            <option value="2">Assistant</option>
+                        </select>
+                    </div>
+
+                    <hr class="sc-divider" />
+
                     <!-- Prompts -->
                     <h4 class="sc-section-title">✏️ Summarizer Prompts</h4>
 
@@ -316,7 +371,8 @@
                             <small>Prompt Preset</small>
                         </label>
                         <select id="sc_prompt_preset" class="text_pole">
-                            <option value="narrative">Narrative State (Default)</option>
+                            <option value="narrative">Narrative State (compact)</option>
+                            <option value="detailed">Detailed (SOTA, full-fidelity)</option>
                             <option value="gamestate">Game State</option>
                             <option value="custom">Custom</option>
                         </select>

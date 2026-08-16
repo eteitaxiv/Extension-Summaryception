@@ -162,6 +162,22 @@ Every summary is a **minimal diff**, not a redundant recap.
 
 ---
 
+## 🔌 Injection: the `{{sum}}` macro
+
+Summaryception exposes a `{{sum}}` macro that resolves to the assembled summary block (all layers + snippets, wrapped in the Injection Wrapper Template). Place it anywhere ST does macro substitution:
+
+- Chat Completion preset entries (any field)
+- Character card fields (description, personality, scenario, first message, etc.)
+- World Info / Lorebook entries
+- Persona description
+- Author's Note
+
+The macro reads live state on every call, so previews, regenerations, and chat swaps always reflect the current summary.
+
+> 💡 Want zero auto-injection? Turn OFF **"Auto-inject at depth-0 (legacy)"** in Advanced Settings, then place `{{sum}}` only where you want it. Otherwise, the legacy depth-0 auto-injector also runs and you may see duplicate summaries.
+
+---
+
 ## 🛡️ Resilient API Handling
 
 - **Exponential backoff** with jitter for rate limits (429) and server errors (500/502/503/504)
@@ -194,9 +210,11 @@ All settings are adjustable from the SillyTavern Extensions panel:
 |---|---|---|
 | Verbatim Turns | 10 | Recent assistant turns kept word-for-word |
 | Turns per Batch | 3 | Oldest turns summarized together per trigger |
+| Context Token Threshold | 0 | Don't summarize until visible chat exceeds this many tokens **and** turns exceed the verbatim limit. `0` = disabled (turn-count trigger only). When triggered, runs a bulk catch-up (like Force Summarize Now) down to the verbatim limit. E.g., `30000` = wait until ~30k tokens. |
 | Snippets per Layer | 30 | Max snippets before promoting to next layer |
 | Snippets per Promotion | 3 | How many snippets merge on promotion |
 | Max Layers | 5 | Maximum recursion depth |
+| Auto-inject at depth-0 | ON | Also inject summary as a depth-0 message next to the latest turn. Turn OFF and place `{{sum}}` manually to control placement. |
 
 ### Prompt Presets
 
@@ -232,8 +250,9 @@ Summaryception can use different backends for summarization, independent of your
 
 ## 🗂️ Built-in Tools
 
+- **`{{sum}}` macro** — Place anywhere in your preset / character card / world info to embed the assembled summary block at that position
 - **Layer Stats** — Live view of snippet counts per layer and ghosted message count
-- **Injection Preview** — See exactly what gets sent to the LLM
+- **Injection Preview** — See exactly what `{{sum}}` resolves to
 - **Snippet Browser** — Browse, edit, regenerate, and delete individual snippets across all layers
 - **Export/Import** — Save and restore memory as JSON
 - **Force Summarize** — Manually trigger summarization

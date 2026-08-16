@@ -98,6 +98,35 @@
     font-style: italic;
 }
 
+.sc-settings .sc-info-box {
+    padding: 8px 10px;
+    border: 1px solid var(--SmartThemeBorderColor, #444);
+    border-left: 3px solid var(--SmartThemeQuoteColor, #43b581);
+    border-radius: 6px;
+    background: rgba(0, 0, 0, 0.1);
+    font-size: 0.85em;
+    line-height: 1.4;
+}
+
+.sc-settings .sc-info-box p {
+    margin: 4px 0;
+}
+
+.sc-settings .sc-info-box p:first-child {
+    margin-top: 0;
+}
+
+.sc-settings .sc-info-box p:last-child {
+    margin-bottom: 0;
+}
+
+.sc-settings .sc-info-box code {
+    background: rgba(255,255,255,0.08);
+    padding: 1px 4px;
+    border-radius: 3px;
+    font-size: 0.95em;
+}
+
 .sc-settings .sc-button-row {
     display: flex;
     gap: 8px;

@@ -49,24 +49,6 @@ function proxiedUrl(url, useProxy = true) {
 }
 
 /**
- * Check if the CORS proxy is available (enabled in ST config).
- * @returns {boolean}
- */
-function isCorsProxyAvailable() {
-    try {
-        const ctx = SillyTavern.getContext();
-        // ST exposes the CORS proxy at /proxy/:url(*) when enableCorsProxy is true.
-        // We can check by looking at the app's CLI args or config.
-        // However, from the extension context we don't have direct access to the config.
-        // The safest approach: always try the proxy first and fall back to direct.
-        // The proxy endpoint returns a clear error message if disabled.
-        return true; // optimistic — we'll fall back to direct if it fails
-    } catch (e) {
-        return false;
-    }
-}
-
-/**
  * Get standard request headers including ST's CSRF token if available.
  * Required when routing through ST's /cors/ proxy.
  * @returns {object}
@@ -462,6 +444,9 @@ async function sendViaOpenAI(url, apiKey, model, systemPrompt, userPrompt, maxTo
         }
     }
 
+    // Decide whether to use CORS proxy
+    const isLocal = /^https?:\/\/(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+)(:\d+)?/i.test(endpoint);
+
     const headers = {
         'Content-Type': 'application/json',
     };
@@ -489,42 +474,41 @@ async function sendViaOpenAI(url, apiKey, model, systemPrompt, userPrompt, maxTo
 
     const body = JSON.stringify(requestBody);
 
-    // Always try the CORS proxy first, then fall back to direct fetch.
-    // Many cloud endpoints (e.g. ollama.com) don't send CORS headers,
-    // so a direct browser fetch will fail with a CORS error even though
-    // the API itself works fine. The ST CORS proxy bypasses this by
-    // making the request server-side from the ST backend.
     let response;
-    let usedProxy = false;
-    try {
-        response = await fetch(proxiedUrl(endpoint), {
-            method: 'POST',
-            headers: { ...getProxyHeaders(), ...headers },
-            body: body,
-        });
-        usedProxy = true;
-    } catch (proxyError) {
-        console.warn(`${MODULE_NAME} CORS proxy fetch threw, trying direct:`, proxyError.message);
-    }
-
-    // If the proxy returned a non-ok response that looks like a proxy-level
-    // error (disabled, forbidden, etc.), fall back to direct fetch.
-    if (!response || (usedProxy && !response.ok && (response.status === 403 || response.status === 404))) {
-        if (response) {
-            const errPreview = await response.text().catch(() => '');
-            console.warn(`${MODULE_NAME} CORS proxy returned ${response.status}, trying direct. Body: ${errPreview.substring(0, 200)}`);
+    if (isLocal) {
+        try {
+            response = await fetch(proxiedUrl(endpoint), {
+                method: 'POST',
+                headers: { ...getProxyHeaders(), ...headers },
+                                   body: body,
+            });
+        } catch (proxyError) {
+            console.warn(`${MODULE_NAME} CORS proxy failed for OpenAI endpoint, trying direct:`, proxyError.message);
+            try {
+                response = await fetch(endpoint, {
+                    method: 'POST',
+                    headers: headers,
+                    body: body,
+                });
+            } catch (directError) {
+                throw new ConnectionError(
+                    `Failed to connect to ${baseUrl}. ` +
+                    `Enable the CORS proxy in config.yaml (enableCorsProxy: true). ` +
+                    `Proxy error: ${proxyError.message}. Direct error: ${directError.message}`,
+                    { retryable: true }
+                );
+            }
         }
+    } else {
         try {
             response = await fetch(endpoint, {
                 method: 'POST',
                 headers: headers,
                 body: body,
             });
-        } catch (directError) {
+        } catch (fetchError) {
             throw new ConnectionError(
-                `Failed to connect to ${baseUrl}. ` +
-                `Enable the CORS proxy in config.yaml (enableCorsProxy: true). ` +
-                `Direct error: ${directError.message}`,
+                `Failed to connect to ${baseUrl}: ${fetchError.message}`,
                 { retryable: true }
             );
         }
@@ -578,18 +562,9 @@ async function sendViaOpenAI(url, apiKey, model, systemPrompt, userPrompt, maxTo
 
                 try {
                     const parsed = JSON.parse(data);
-                    const delta = parsed.choices?.[0]?.delta;
+                    const delta = parsed.choices?.[0]?.delta?.content;
                     if (delta) {
-                        // Read both content and reasoning fields.
-                        // Reasoning models (e.g. GLM-5.2, DeepSeek-R1, gpt-oss)
-                        // put their output in delta.reasoning while delta.content
-                        // stays empty. If content is present, prefer it; otherwise
-                        // use reasoning so the summary still gets the model's output.
-                        if (delta.content) {
-                            fullContent += delta.content;
-                        } else if (delta.reasoning) {
-                            fullContent += delta.reasoning;
-                        }
+                        fullContent += delta;
                     }
                 } catch (e) {
                     // Skip unparseable chunks (comments, keep-alive, etc.)
@@ -623,9 +598,9 @@ export async function testOpenAIConnection(url, apiKey, model) {
             url,
             apiKey,
             model || 'test',
-            'You are a test assistant. Respond briefly.',
+            'You are a test assistant.',
             'Respond with exactly: CONNECTION_OK',
-            500 // generous token limit — reasoning models need room to think before answering
+            100 // small token limit for test
         );
         return {
             success: true,

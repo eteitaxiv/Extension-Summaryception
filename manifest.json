@@ -1,0 +1,12 @@
+{
+    "display_name": "Summaryception",
+    "loading_order": 50,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "Lodactio",
+    "version": "5.5.3",
+    "homePage": "https://github.com/Lodactio/Extension-Summaryception",
+    "auto_update": true
+}

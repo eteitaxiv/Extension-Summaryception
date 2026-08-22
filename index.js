@@ -1,5 +1,5 @@
 /**
- * Summaryception v5.5.3 — Layered Recursive Summarization for SillyTavern
+ * Summaryception v6.0.0 — Layered Recursive Summarization for SillyTavern
  *
  * NON-DESTRUCTIVE: Uses SillyTavern's native /hide and /unhide commands
  * to exclude summarized messages from LLM context while keeping them
@@ -598,16 +598,125 @@ async function repairIfBranched() {
             store.ghostedIndices = store.ghostedIndices.filter(idx => idx < chatLength);
         }
 
+        // ─── Unghost messages beyond the new summarizedUpTo ──────────
+        // When a branch is created, SillyTavern copies messages 0..N with
+        // their original flags intact. In the parent chat, all of those
+        // messages were likely ghosted (sc_ghosted + is_hidden). But in this
+        // branch, only messages up to the new summarizedUpTo are actually
+        // covered by snippets. Messages beyond that point were never
+        // summarized here — they must be unghosted so they become normal
+        // visible turns the summarizer can process going forward.
+        //
+        // Without this, the user is forced to manually unhide those messages
+        // via ST's UI. That only clears is_hidden but leaves sc_ghosted=true,
+        // which makes SC ignore them (never summarize, never re-hide) while
+        // the LLM still sees them — permanently corrupting the context window.
+        const ctx = SillyTavern.getContext();
+        let unghostedCount = 0;
+        for (let i = store.summarizedUpTo + 1; i < chatLength; i++) {
+            const m = chat[i];
+            if (!m) continue;
+            if (!m.extra?.sc_ghosted) continue;
+
+            delete m.extra.sc_ghosted;
+            if (store.ghostedIndices) {
+                store.ghostedIndices = store.ghostedIndices.filter(idx => idx !== i);
+            }
+
+            if (m.is_hidden) {
+                try {
+                    await ctx.executeSlashCommandsWithOptions(`/unhide ${i}`, { showOutput: false });
+                } catch (e) {
+                    log(`Branch repair: failed to unhide message ${i}:`, e);
+                }
+            }
+            unghostedCount++;
+        }
+
+        if (unghostedCount > 0) {
+            log(`Branch repair: unghosted ${unghostedCount} messages beyond summarizedUpTo ${store.summarizedUpTo}`);
+        }
+
         await saveChatStore();
 
         log(`Branch repair complete. summarizedUpTo: ${oldSummarizedUpTo} → ${store.summarizedUpTo}`);
 
         toastr.info(
-            `Branch detected — trimmed ${oldSummarizedUpTo - store.summarizedUpTo} turns of stale summary data that referenced messages beyond the branch point.`,
+            `Branch detected — trimmed ${oldSummarizedUpTo - store.summarizedUpTo} turns of stale summary data${unghostedCount > 0 ? `, restored ${unghostedCount} unsummarized messages` : ''}.`,
             'Summaryception — Branch Repair',
             { timeOut: 6000 }
         );
     }
+}
+
+// ─── Ghosting Sync ────────────────────────────────────────────────────
+
+/**
+ * Synchronize sc_ghosted flags with actual message hidden state.
+ *
+ * Detects messages where sc_ghosted=true but is_hidden=false — meaning the
+ * user manually unhid them via SillyTavern's native UI (which only toggles
+ * is_hidden, not our sc_ghosted flag). This creates a desync:
+ *
+ *   - SC thinks the message is summarized (sc_ghosted) → skips it
+ *   - But the LLM can see it (is_hidden=false) → it leaks into context
+ *
+ * Two cases:
+ *   1. Message is BEYOND summarizedUpTo → it was never actually summarized
+ *      in this chat. Clear sc_ghosted so SC treats it as a normal visible
+ *      turn and will summarize + ghost it properly when the limit is hit.
+ *   2. Message is WITHIN summarizedUpTo → it IS summarized. Re-hide it to
+ *      maintain the invariant that summarized messages are excluded from
+ *      LLM context.
+ *
+ * Called at the start of every summarization pass.
+ */
+async function syncGhostingState() {
+    const { chat } = SillyTavern.getContext();
+    const store = getChatStore();
+    const s = getSettings();
+    let cleared = 0;
+    let rehidden = 0;
+
+    if (!chat || chat.length === 0) return 0;
+
+    for (let i = 0; i < chat.length; i++) {
+        const m = chat[i];
+        if (!m) continue;
+        if (!m.extra?.sc_ghosted) continue;
+
+        // sc_ghosted but NOT hidden — user manually unhid it
+        if (!m.is_hidden) {
+            if (i > store.summarizedUpTo) {
+                // Beyond the summary point: this message is NOT actually
+                // summarized. Clear the flag so it becomes a normal visible
+                // turn that the summarizer will process and ghost properly.
+                delete m.extra.sc_ghosted;
+                if (store.ghostedIndices) {
+                    store.ghostedIndices = store.ghostedIndices.filter(idx => idx !== i);
+                }
+                cleared++;
+                log(`Sync: cleared stale sc_ghosted on message ${i} (beyond summarizedUpTo ${store.summarizedUpTo}, was manually unhidden)`);
+            } else if (!s.disableGhosting) {
+                // Within the summary point: re-hide it to maintain the
+                // invariant that summarized messages are excluded from
+                // LLM context.
+                try {
+                    await SillyTavern.getContext().executeSlashCommandsWithOptions(`/hide ${i}`, { showOutput: false });
+                    rehidden++;
+                } catch (e) {
+                    log(`Sync: failed to re-hide message ${i}:`, e);
+                }
+            }
+        }
+    }
+
+    if (cleared > 0 || rehidden > 0) {
+        await saveChatStore();
+        log(`Sync: cleared ${cleared} stale ghost flags, re-hid ${rehidden} unhidden summarized messages`);
+    }
+
+    return cleared + rehidden;
 }
 
 // ─── Assistant Turn Utilities ────────────────────────────────────────
@@ -1026,6 +1135,14 @@ async function maybeSummarizeTurns() {
 
     const { chat } = SillyTavern.getContext();
     const store = getChatStore();
+
+    // ─── Sync ghosting state before counting visible turns ────────
+    // Detects messages the user manually unhid (via ST's native UI) that
+    // still carry our sc_ghosted flag. Without this, those messages are
+    // invisible to the summarizer (skipped by sc_ghosted) yet visible to
+    // the LLM (is_hidden=false) — permanently leaking into context.
+    // This is the common path after branching + manual unhiding.
+    await syncGhostingState();
 
     const allAssistantTurns = getAssistantTurns(chat);
     const visibleTurns = allAssistantTurns.filter(t => !chat[t.index].extra?.sc_ghosted);
@@ -3025,8 +3142,19 @@ async function fetchProfilesFallback(selectElement, currentValue) {
 
     getSettings();
 
+    // Derive the extension folder path from this script's own URL so the
+    // template fetch works regardless of the installed folder name (forks,
+    // renamed copies, etc.). Previously this was hardcoded to
+    // 'third-party/Extension-Summaryception', which 404'd when the extension
+    // lived in a differently-named folder (e.g. 'ST-Extension-Summaryception').
+    const scriptUrl = import.meta.url;
+    // scriptUrl looks like https://host/scripts/extensions/third-party/<Folder>/index.js
+    // We want the path 'third-party/<Folder>'.
+    const match = scriptUrl && scriptUrl.match(/\/extensions\/(third-party\/[^/]+)\//);
+    const extensionPath = match ? match[1] : 'third-party/Extension-Summaryception';
+
     const html = await renderExtensionTemplateAsync(
-        'third-party/Extension-Summaryception',
+        extensionPath,
         'settings',
         {}
     );
@@ -3050,6 +3178,6 @@ async function fetchProfilesFallback(selectElement, currentValue) {
         registerSumMacro();
         updateInjection();
         updateUI();
-        console.log(LOG_PREFIX, 'v5.5.3 loaded. {{sum}} macro + Connection Settings available');
+        console.log(LOG_PREFIX, 'v6.0.0 loaded. {{sum}} macro + Connection Settings available');
     });
 })();

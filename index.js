@@ -109,6 +109,34 @@ Write in short phrases, no more than 20; output must be a single line:`,
 
 // ─── Prompt Presets ──────────────────────────────────────────────────
 
+// Presets that have been replaced by newer versions. Used to migrate users
+// whose saved settings still hold the old text.
+const LEGACY_PROMPTS = {
+    detailed_v1: `<player_name>
+{{player_name}}
+</player_name>
+
+<prior_context>
+{{context_str}}
+</prior_context>
+
+<passage_in_question>
+{{story_txt}}
+</passage_in_question>
+
+Summarize the passage_in_question to coherently continue the prior_context. If the passage_in_question has 2nd person point of view, 'you' pronoun in prose refers to the player. Use the player name in the summary output instead of 'you'.
+
+Preserve every meaningful beat — do not omit anything that could matter later. Write as continuous narrative in the same tense and person as the prior_context, NOT as analysis. Capture in the prose itself:
+
+- What characters say, do, and how they respond to each other
+- Emotional tone and shifting attitudes, shown through behavior and wording, not labeled or diagnosed
+- Sensory details, atmosphere, mood, significant wording
+- Exact names, locations, items, time markers
+- What is left unresolved or hanging
+
+Exclude only events already covered in the prior_context. Be specific, not flowery. Multiple paragraphs are permitted as needed. Do NOT add meta-commentary, narrative status reports, or analytical observations about the scene. Do NOT restate information already covered in an earlier paragraph. Maintain chronological order.`,
+};
+
 const PROMPT_PRESETS = {
     narrative: `<player_name>
 {{player_name}}
@@ -164,15 +192,15 @@ Write in short phrases, no more than 20; output must be a single line:`,
 
 Summarize the passage_in_question to coherently continue the prior_context. If the passage_in_question has 2nd person point of view, 'you' pronoun in prose refers to the player. Use the player name in the summary output instead of 'you'.
 
-Preserve every meaningful beat — do not omit anything that could matter later. Write as continuous narrative in the same tense and person as the prior_context, NOT as analysis. Capture in the prose itself:
+Preserve the story flow — do not omit anything that could matter later. Write as shortened and compressed narrative in the same tense and person as the prior_context, NOT as analysis. Capture in the prose itself:
 
-- What characters say, do, and how they respond to each other
-- Emotional tone and shifting attitudes, shown through behavior and wording, not labeled or diagnosed
+- What characters do, and how they respond to each other
+- Emotional tone and shifting attitudes
 - Sensory details, atmosphere, mood, significant wording
 - Exact names, locations, items, time markers
 - What is left unresolved or hanging
 
-Exclude only events already covered in the prior_context. Be specific, not flowery. Multiple paragraphs are permitted as needed. Do NOT add meta-commentary, narrative status reports, or analytical observations about the scene. Do NOT restate information already covered in an earlier paragraph. Maintain chronological order.`,
+Exclude events already covered in the prior_context. Be specific, not flowery. Multiple paragraphs are permitted as needed but the aim is a shortened summary. Do NOT add meta-commentary, narrative status reports, or analytical observations about the scene. Do NOT restate information already covered in an earlier paragraph. Maintain chronological order. Only, **ONLY** output summary, as your task is to summarize for future continuations.`,
 
     custom: null, // Uses whatever is in the textarea
 };
@@ -940,6 +968,9 @@ function cleanSummarizerOutput(raw) {
         /<thought>[\s\S]*?<\/thought>/gi,
         /<reflect>[\s\S]*?<\/reflect>/gi,
         /<inner_monologue>[\s\S]*?<\/inner_monologue>/gi,
+        // DeepSeek-R1 style: thinking starts at the marker and runs until
+        // the closing marker (or end of text if the model never closed it).
+        /<think>[\s\S]*?(?:<\/think>|$)/gi,
     ];
 
     for (const regex of blockPatterns) {
@@ -1975,6 +2006,17 @@ function updateUI() {
             } else {
                 // User customized their prompt — mark as custom
                 s.promptPreset = 'custom';
+                saveSettings();
+            }
+        }
+        // Migration: users still on the old (v1) detailed preset get upgraded
+        // to the new compressed detailed preset. Users who edited the prompt
+        // (no longer matching the old preset verbatim) are left untouched.
+        if (s.promptPreset === 'detailed') {
+            const currentPrompt = (s.summarizerUserPrompt || '').trim();
+            if (currentPrompt === LEGACY_PROMPTS.detailed_v1.trim()) {
+                s.summarizerUserPrompt = PROMPT_PRESETS.detailed;
+                $('#sc_summarizer_user_prompt').val(PROMPT_PRESETS.detailed);
                 saveSettings();
             }
         }

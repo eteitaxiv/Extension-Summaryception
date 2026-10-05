@@ -98,9 +98,9 @@ export async function sendSummarizerRequest(settings, systemPrompt, userPrompt) 
         case 'profile':
             return await sendViaProfile(settings.connectionProfileId, systemPrompt, userPrompt);
         case 'ollama':
-            return await sendViaOllama(settings.ollamaUrl, settings.ollamaModel, systemPrompt, userPrompt);
+            return await sendViaOllama(settings.ollamaUrl, settings.ollamaModel, systemPrompt, userPrompt, settings.disableReasoning);
         case 'openai':
-            return await sendViaOpenAI(settings.openaiUrl, settings.openaiKey, settings.openaiModel, systemPrompt, userPrompt, settings.openaiMaxTokens);
+            return await sendViaOpenAI(settings.openaiUrl, settings.openaiKey, settings.openaiModel, systemPrompt, userPrompt, settings.openaiMaxTokens, settings.disableReasoning);
         case 'default':
         default:
             return await sendViaDefault(systemPrompt, userPrompt, settings.summarizerResponseLength);
@@ -294,7 +294,7 @@ async function sendViaProfile(profileId, systemPrompt, userPrompt) {
  * Send a request to a local Ollama instance using /api/chat.
  * Routes through ST's CORS proxy to avoid browser CORS restrictions.
  */
-async function sendViaOllama(url, model, systemPrompt, userPrompt) {
+async function sendViaOllama(url, model, systemPrompt, userPrompt, disableReasoning) {
     if (!url) {
         throw new ConnectionError(
             'Ollama URL is not configured. Please set it in Summaryception settings.',
@@ -311,6 +311,24 @@ async function sendViaOllama(url, model, systemPrompt, userPrompt) {
     const baseUrl = url.replace(/\/+$/, '');
     const targetUrl = `${baseUrl}/api/chat`;
 
+    const payload = {
+        model: model,
+        messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt },
+        ],
+        stream: false,
+        options: {
+            temperature: 0.3,
+        },
+    };
+
+    // Ollama's native switch for turning model thinking off (v0.9+).
+    // Older Ollama versions ignore the field.
+    if (disableReasoning) {
+        payload.think = false;
+    }
+
     let response;
     try {
         response = await fetch(proxiedUrl(targetUrl), {
@@ -319,17 +337,7 @@ async function sendViaOllama(url, model, systemPrompt, userPrompt) {
                 ...getProxyHeaders(),
                                'Content-Type': 'application/json',
             },
-            body: JSON.stringify({
-                model: model,
-                messages: [
-                    { role: 'system', content: systemPrompt },
-                    { role: 'user', content: userPrompt },
-                ],
-                stream: false,
-                options: {
-                    temperature: 0.3,
-                },
-            }),
+            body: JSON.stringify(payload),
         });
     } catch (proxyError) {
         console.warn(`${MODULE_NAME} CORS proxy failed, trying direct:`, proxyError.message);
@@ -337,15 +345,7 @@ async function sendViaOllama(url, model, systemPrompt, userPrompt) {
             response = await fetch(targetUrl, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    model: model,
-                    messages: [
-                        { role: 'system', content: systemPrompt },
-                        { role: 'user', content: userPrompt },
-                    ],
-                    stream: false,
-                    options: { temperature: 0.3 },
-                }),
+                body: JSON.stringify(payload),
             });
         } catch (directError) {
             throw new ConnectionError(
@@ -436,7 +436,7 @@ export async function fetchOllamaModels(url) {
  * Routes through ST's CORS proxy for local endpoints.
  * Cloud endpoints skip the proxy since they have CORS headers.
  */
-async function sendViaOpenAI(url, apiKey, model, systemPrompt, userPrompt, maxTokens) {
+async function sendViaOpenAI(url, apiKey, model, systemPrompt, userPrompt, maxTokens, disableReasoning) {
     if (!url) {
         throw new ConnectionError(
             'OpenAI Compatible URL is not configured. Please set it in Summaryception settings.',
@@ -485,6 +485,12 @@ async function sendViaOpenAI(url, apiKey, model, systemPrompt, userPrompt, maxTo
     // Only include max_tokens if explicitly set
     if (tokenLimit) {
         requestBody.max_tokens = tokenLimit;
+    }
+
+    // Ask the model not to think at all. Providers that don't understand
+    // reasoning_effort ignore it; reasoning-capable providers honor "none".
+    if (disableReasoning) {
+        requestBody.reasoning_effort = 'none';
     }
 
     const body = JSON.stringify(requestBody);
@@ -580,15 +586,10 @@ async function sendViaOpenAI(url, apiKey, model, systemPrompt, userPrompt, maxTo
                     const parsed = JSON.parse(data);
                     const delta = parsed.choices?.[0]?.delta;
                     if (delta) {
-                        // Read both content and reasoning fields.
-                        // Reasoning models (e.g. GLM-5.2, DeepSeek-R1, gpt-oss)
-                        // put their output in delta.reasoning while delta.content
-                        // stays empty. If content is present, prefer it; otherwise
-                        // use reasoning so the summary still gets the model's output.
+                        // Collect content only. Reasoning/thinking is never
+                        // wanted in summaries — it is discarded, not appended.
                         if (delta.content) {
                             fullContent += delta.content;
-                        } else if (delta.reasoning) {
-                            fullContent += delta.reasoning;
                         }
                     }
                 } catch (e) {
@@ -625,7 +626,8 @@ export async function testOpenAIConnection(url, apiKey, model) {
             model || 'test',
             'You are a test assistant. Respond briefly.',
             'Respond with exactly: CONNECTION_OK',
-            500 // generous token limit — reasoning models need room to think before answering
+            500, // generous token limit in case the provider still emits reasoning
+            true // disable thinking — test with reasoning_effort: none
         );
         return {
             success: true,

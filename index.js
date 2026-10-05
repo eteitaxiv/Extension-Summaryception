@@ -96,6 +96,9 @@ Write in short phrases, no more than 20; output must be a single line:`,
 
     // ─── Connection Settings ─────────────────────────────────────
     connectionSource: 'default',          // 'default' | 'profile' | 'ollama' | 'openai'
+    // When true, summarizer calls ask the model not to think:
+    // reasoning_effort: "none" (OpenAI-compatible) and think: false (Ollama).
+    disableReasoning: true,
     summarizerResponseLength: 0,          // 0 = use preset default; set lower if you get "max_tokens > 4096 must have stream=true" errors
     connectionProfileId: '',              // ID of selected ST Connection Profile
     ollamaUrl: 'http://localhost:11434',
@@ -2026,6 +2029,7 @@ function updateUI() {
         $('#sc_trace_mode').prop('checked', s.traceMode);
         $('#sc_strip_patterns').val((s.stripPatterns || []).join('\n'));
         $('#sc_summarizer_response_length').val(s.summarizerResponseLength || 0);
+        $('#sc_disable_reasoning').prop('checked', s.disableReasoning);
 
         let ghostedCount = 0;
         try {
@@ -2465,6 +2469,11 @@ function bindUIEvents() {
 
     $(document).on('change', '#sc_debug_mode', function () {
         getSettings().debugMode = $(this).prop('checked');
+        saveSettings();
+    });
+
+    $(document).on('change', '#sc_disable_reasoning', function () {
+        getSettings().disableReasoning = $(this).prop('checked');
         saveSettings();
     });
 

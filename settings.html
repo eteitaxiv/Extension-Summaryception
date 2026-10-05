@@ -122,6 +122,14 @@
                             <input id="sc_summarizer_response_length" type="number" class="text_pole" min="0" step="100" value="0" placeholder="0 = use preset default" />
                         </div>
 
+                        <div class="summaryception-setting-row">
+                            <label class="checkbox_label" for="sc_disable_reasoning">
+                                <input type="checkbox" id="sc_disable_reasoning" />
+                                <span>Disable Model Thinking</span>
+                                <small>Sends reasoning_effort: "none" (OpenAI Compatible) and think: false (Ollama) with summarizer calls, and discards any reasoning the model still emits. Off by design: summaries never need thinking.</small>
+                            </label>
+                        </div>
+
                         <!-- Connection Source Selector -->
                         <div class="summaryception-setting-row">
                             <label for="summaryception_connection_source">

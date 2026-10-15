@@ -210,6 +210,26 @@ Exclude events already covered in the prior_context. Be specific, not flowery. M
 
 const DEFAULT_PROMPT_PRESET = 'narrative';
 
+// Injection Wrapper Templates per prompt preset. Switching presets applies the
+// preset's wrapper to the Injection Wrapper Template textarea. Presets without
+// a wrapper entry (custom) leave the current one untouched.
+const PRESET_INJECTION_TEMPLATES = Object.freeze({
+    narrative: defaultSettings.injectionTemplate,
+    gamestate: defaultSettings.injectionTemplate,
+    detailed: `<summary>
+This is a summary of the events so far. Every turn before the continuation is summarized here for token economy. Everything in the summary was role-played in this role-play and happened after time-zero.
+
+<summary>
+{{summary}}
+</summary>
+
+In the regular turns, continue from the last state in the summary.
+
+- **THIS SUMMARY** is not written by the User, it is added automatically to the User's turn at the role-play's beginning, its purpose is to summarize the role-play for your attention only.
+</summary>`,
+    custom: null,
+});
+
 // ─── Retry Configuration ─────────────────────────────────────────────
 
 const RETRY_CONFIG = {
@@ -2051,6 +2071,14 @@ function updateUI() {
                 saveSettings();
             }
         }
+        // Migration: users on the detailed preset with the old default
+        // injection wrapper get upgraded to the detailed preset's wrapper.
+        // Users who customized the wrapper are left untouched.
+        if (s.promptPreset === 'detailed' && (s.injectionTemplate || '') === defaultSettings.injectionTemplate) {
+            s.injectionTemplate = PRESET_INJECTION_TEMPLATES.detailed;
+            $('#sc_injection_template').val(s.injectionTemplate);
+            saveSettings();
+        }
 
         $('#sc_prompt_preset').val(s.promptPreset);
         $('#sc_debug_mode').prop('checked', s.debugMode);
@@ -2774,6 +2802,15 @@ function bindUIEvents() {
             $('#sc_summarizer_user_prompt').val(presetText);
             s.summarizerUserPrompt = presetText;
             $('#sc_custom_prompt_manager').hide();
+
+            // Apply the preset's Injection Wrapper Template (custom keeps the
+            // current one so the user stays in full control)
+            const presetInjection = PRESET_INJECTION_TEMPLATES[selected];
+            if (presetInjection) {
+                s.injectionTemplate = presetInjection;
+                $('#sc_injection_template').val(presetInjection);
+                updateInjection();
+            }
         }
 
         saveSettings();

@@ -297,7 +297,7 @@ function debugVisibleTurns(chat, store) {
             visibleIndices.push(i);
         }
         if (m.extra?.sc_ghosted) ghostedCount++;
-        if (m.is_hidden || m.is_system) hiddenCount++;
+        if (m.is_system) hiddenCount++;
     }
 
     trace('  Visible non-ghosted turns:', visibleCount);
@@ -382,7 +382,7 @@ async function repairGhostingForRange(startIdx, endIdx) {
             continue;
         }
 
-        if (m.is_hidden && !m.extra?.sc_ghosted) {
+        if (m.is_system && !m.extra?.sc_ghosted) {
             trace(' Skipping message ' + i + ' - user-hidden');
             skipped++;
             continue;
@@ -430,7 +430,9 @@ async function ghostMessage(messageIndex) {
     const msg = chat[messageIndex];
     if (!msg) return;
     if (!msg.extra) msg.extra = {};
-    if (msg.extra.sc_ghosted) return;
+    // Already flagged AND actually hidden — nothing to do. If it is flagged
+    // but visible (user manually unhid it), fall through and re-hide it.
+    if (msg.extra.sc_ghosted && msg.is_system) return;
 
     msg.extra.sc_ghosted = true;
 
@@ -457,25 +459,35 @@ async function unghostAllMessages() {
     const { chat } = SillyTavern.getContext();
     const store = getChatStore();
 
-    // Only unhide messages that WE ghosted, not user-hidden messages
-    const toUnhide = store.ghostedIndices && store.ghostedIndices.length > 0
-        ? [...store.ghostedIndices]
-        : [];
+    // Unhide every message Summaryception hid: the indices we tracked AND
+    // anything still carrying our sc_ghosted flag. The two lists can drift
+    // apart (branch repairs, manual unhides, index shifts), so scan both —
+    // never user-hidden messages (no flag, not tracked).
+    const toUnhide = new Set();
 
-    // Fallback for older saves that don't have ghostedIndices:
-    // find messages with our sc_ghosted flag
-    if (toUnhide.length === 0) {
-        for (let i = 0; i < chat.length; i++) {
-            if (chat[i]?.extra?.sc_ghosted) {
-                toUnhide.push(i);
+    if (Array.isArray(store.ghostedIndices)) {
+        for (const idx of store.ghostedIndices) {
+            if (Number.isInteger(idx) && idx >= 0 && idx < chat.length) {
+                toUnhide.add(idx);
             }
         }
     }
 
-    if (toUnhide.length === 0) return;
+    for (let i = 0; i < chat.length; i++) {
+        if (chat[i]?.extra?.sc_ghosted) {
+            toUnhide.add(i);
+        }
+    }
+
+    if (toUnhide.size === 0) {
+        log('Nothing to unhide — no Summaryception-hidden messages in this chat.');
+        return 0;
+    }
+
+    const sortedUnhide = [...toUnhide].sort((a, b) => a - b);
 
     const progressToast = toastr.info(
-        `Unhiding messages: 0 / ${toUnhide.length}`,
+        `Unhiding messages: 0 / ${sortedUnhide.length}`,
         'Summaryception — Clearing',
         {
             timeOut: 0,
@@ -485,34 +497,34 @@ async function unghostAllMessages() {
     );
 
     let processed = 0;
-    for (const idx of toUnhide) {
-        if (idx >= 0 && idx < chat.length) {
-            // Clear our ghost flag
-            if (chat[idx]?.extra?.sc_ghosted) {
-                delete chat[idx].extra.sc_ghosted;
-            }
+    for (const idx of sortedUnhide) {
+        // Clear our ghost flag
+        if (chat[idx]?.extra?.sc_ghosted) {
+            delete chat[idx].extra.sc_ghosted;
+        }
 
-            try {
-                await SillyTavern.getContext().executeSlashCommandsWithOptions(`/unhide ${idx}`, { showOutput: false });
-            } catch (e) {
-                log(`Failed to unhide message ${idx}:`, e);
-            }
+        try {
+            await SillyTavern.getContext().executeSlashCommandsWithOptions(`/unhide ${idx}`, { showOutput: false });
+        } catch (e) {
+            log(`Failed to unhide message ${idx}:`, e);
         }
 
         processed++;
         if (processed % 10 === 0) {
-            const pct = Math.round((processed / toUnhide.length) * 100);
+            const pct = Math.round((processed / sortedUnhide.length) * 100);
             $(progressToast).find('.toast-message').text(
-                `Unhiding messages: ${processed} / ${toUnhide.length} (${pct}%)`
+                `Unhiding messages: ${processed} / ${sortedUnhide.length} (${pct}%)`
             );
         }
     }
 
-    // Clear the tracking array
+    // Clear the tracking array and persist the metadata
     store.ghostedIndices = [];
+    await saveChatStore();
 
     toastr.clear(progressToast);
-    log(`Unghosted ${toUnhide.length} messages (only Summaryception-hidden ones)`);
+    log(`Unghosted ${sortedUnhide.length} messages (only Summaryception-hidden ones)`);
+    return sortedUnhide.length;
 }
 
 async function ghostMessagesUpTo(endIndex) {
@@ -534,15 +546,12 @@ async function ghostMessagesUpTo(endIndex) {
     for (let i = 0; i <= endIndex; i++) {
         const msg = chat[i];
         if (!msg) continue;
+        // Hidden by the user via ST's UI (is_system, never ours) — leave it alone
         if (msg.is_system && !msg.extra?.sc_ghosted) continue;
         if (!msg.extra) msg.extra = {};
-        if (msg.extra.sc_ghosted) continue;
-
-        // Check if the message is already hidden by the user (not by us)
-        if (msg.is_hidden) {
-            log(`Skipping message ${i} — already hidden by user`);
-            continue;
-        }
+        // Already flagged AND actually hidden — skip. If it is flagged but
+        // visible (e.g. the user manually unhid it), fall through and re-hide.
+        if (msg.extra.sc_ghosted && msg.is_system) continue;
 
         msg.extra.sc_ghosted = true;
 
@@ -632,14 +641,14 @@ async function repairIfBranched() {
         // ─── Unghost messages beyond the new summarizedUpTo ──────────
         // When a branch is created, SillyTavern copies messages 0..N with
         // their original flags intact. In the parent chat, all of those
-        // messages were likely ghosted (sc_ghosted + is_hidden). But in this
+        // messages were likely ghosted (sc_ghosted + is_system). But in this
         // branch, only messages up to the new summarizedUpTo are actually
         // covered by snippets. Messages beyond that point were never
         // summarized here — they must be unghosted so they become normal
         // visible turns the summarizer can process going forward.
         //
         // Without this, the user is forced to manually unhide those messages
-        // via ST's UI. That only clears is_hidden but leaves sc_ghosted=true,
+        // via ST's UI. That only clears is_system but leaves sc_ghosted=true,
         // which makes SC ignore them (never summarize, never re-hide) while
         // the LLM still sees them — permanently corrupting the context window.
         const ctx = SillyTavern.getContext();
@@ -654,7 +663,8 @@ async function repairIfBranched() {
                 store.ghostedIndices = store.ghostedIndices.filter(idx => idx !== i);
             }
 
-            if (m.is_hidden) {
+            // ST's /hide sets is_system — unhide only if it is actually hidden
+            if (m.is_system) {
                 try {
                     await ctx.executeSlashCommandsWithOptions(`/unhide ${i}`, { showOutput: false });
                 } catch (e) {
@@ -685,20 +695,22 @@ async function repairIfBranched() {
 /**
  * Synchronize sc_ghosted flags with actual message hidden state.
  *
- * Detects messages where sc_ghosted=true but is_hidden=false — meaning the
- * user manually unhid them via SillyTavern's native UI (which only toggles
- * is_hidden, not our sc_ghosted flag). This creates a desync:
+ * SillyTavern's /hide and /unhide toggle message.is_system — that is the ONLY
+ * hidden flag ST messages carry (there is no is_hidden). This function keeps
+ * our sc_ghosted bookkeeping in sync with it.
  *
- *   - SC thinks the message is summarized (sc_ghosted) → skips it
- *   - But the LLM can see it (is_hidden=false) → it leaks into context
- *
- * Two cases:
- *   1. Message is BEYOND summarizedUpTo → it was never actually summarized
- *      in this chat. Clear sc_ghosted so SC treats it as a normal visible
- *      turn and will summarize + ghost it properly when the limit is hit.
- *   2. Message is WITHIN summarizedUpTo → it IS summarized. Re-hide it to
- *      maintain the invariant that summarized messages are excluded from
- *      LLM context.
+ * Three cases for a message carrying sc_ghosted:
+ *   1. NOT hidden (is_system=false) — the user manually unhid it via ST's UI
+ *      (which only toggles is_system, not our flag):
+ *        a. BEYOND summarizedUpTo → it was never actually summarized here.
+ *           Clear sc_ghosted so SC treats it as a normal visible turn and
+ *           will summarize + ghost it properly when the limit is hit.
+ *        b. WITHIN summarizedUpTo → it IS summarized. Re-hide it to keep
+ *           summarized messages out of LLM context.
+ *   2. Hidden (is_system=true) but BEYOND summarizedUpTo → stale coverage:
+ *      the summary no longer covers it (e.g. after going back to an earlier
+ *      message, the store was trimmed). Restore it to a normal visible turn
+ *      so the summarizer processes it and re-hides it at the proper time.
  *
  * Called at the start of every summarization pass.
  */
@@ -708,6 +720,7 @@ async function syncGhostingState() {
     const s = getSettings();
     let cleared = 0;
     let rehidden = 0;
+    let restored = 0;
 
     if (!chat || chat.length === 0) return 0;
 
@@ -716,8 +729,8 @@ async function syncGhostingState() {
         if (!m) continue;
         if (!m.extra?.sc_ghosted) continue;
 
-        // sc_ghosted but NOT hidden — user manually unhid it
-        if (!m.is_hidden) {
+        if (!m.is_system) {
+            // sc_ghosted but NOT hidden — user manually unhid it
             if (i > store.summarizedUpTo) {
                 // Beyond the summary point: this message is NOT actually
                 // summarized. Clear the flag so it becomes a normal visible
@@ -739,15 +752,30 @@ async function syncGhostingState() {
                     log(`Sync: failed to re-hide message ${i}:`, e);
                 }
             }
+        } else if (i > store.summarizedUpTo) {
+            // Hidden AND flagged, but not covered by the summary — stale
+            // coverage. Restore it to a normal visible turn; the summarizer
+            // will summarize and re-hide it when its time comes.
+            delete m.extra.sc_ghosted;
+            if (store.ghostedIndices) {
+                store.ghostedIndices = store.ghostedIndices.filter(idx => idx !== i);
+            }
+            try {
+                await SillyTavern.getContext().executeSlashCommandsWithOptions(`/unhide ${i}`, { showOutput: false });
+                restored++;
+                log(`Sync: restored message ${i} to visibility (hidden but beyond summarizedUpTo ${store.summarizedUpTo})`);
+            } catch (e) {
+                log(`Sync: failed to unhide message ${i}:`, e);
+            }
         }
     }
 
-    if (cleared > 0 || rehidden > 0) {
+    if (cleared > 0 || rehidden > 0 || restored > 0) {
         await saveChatStore();
-        log(`Sync: cleared ${cleared} stale ghost flags, re-hid ${rehidden} unhidden summarized messages`);
+        log(`Sync: cleared ${cleared} stale ghost flags, re-hid ${rehidden}, restored ${restored} uncovered messages`);
     }
 
-    return cleared + rehidden;
+    return cleared + rehidden + restored;
 }
 
 // ─── Assistant Turn Utilities ────────────────────────────────────────
@@ -789,9 +817,9 @@ function buildPassageFromRange(chat, startIdx, endIdx) {
         if (!m.mes || !m.mes.trim()) continue;
 
         // Skip messages hidden by the user (not by us)
-        // A message hidden by the user will be is_system/is_hidden but NOT sc_ghosted
-        // A message hidden by us will have sc_ghosted = true
-        const isUserHidden = (m.is_system || m.is_hidden) && !m.extra?.sc_ghosted;
+        // A message hidden by the user will be is_system but NOT sc_ghosted
+        // (ST's /hide only sets is_system); a message hidden by us carries sc_ghosted
+        const isUserHidden = m.is_system && !m.extra?.sc_ghosted;
         if (isUserHidden) continue;
 
         const speaker = m.is_user ? 'Player' : 'Assistant';
@@ -841,8 +869,8 @@ function computeVisibleTokens(chat) {
     for (let i = 0; i < chat.length; i++) {
         const m = chat[i];
         if (!m) continue;
-        // Hidden messages (by /hide — user or SC-ghosted) are excluded from LLM context
-        if (m.is_hidden) continue;
+        // Hidden messages (via /hide, which sets is_system) are excluded from LLM context
+        if (m.is_system) continue;
         if (m.extra?.sc_ghosted) continue;
         const text = m.mes || '';
         if (!text.trim()) continue;
@@ -1174,7 +1202,7 @@ async function maybeSummarizeTurns() {
     // Detects messages the user manually unhid (via ST's native UI) that
     // still carry our sc_ghosted flag. Without this, those messages are
     // invisible to the summarizer (skipped by sc_ghosted) yet visible to
-    // the LLM (is_hidden=false) — permanently leaking into context.
+    // the LLM (is_system=false) — permanently leaking into context.
     // This is the common path after branching + manual unhiding.
     await syncGhostingState();
 
@@ -2341,8 +2369,20 @@ function bindUIEvents() {
 
     $(document).on('click', '#sc_restore_hidden', async function () {
         try {
-            await unghostAllMessages();
-            toastr.success('Hidden messages restored', 'Summaryception', { timeOut: 3000 });
+            const restored = await unghostAllMessages();
+            if (restored > 0) {
+                toastr.success(
+                    `${restored} hidden message${restored === 1 ? '' : 's'} restored.`,
+                    'Summaryception',
+                    { timeOut: 3000 }
+                );
+            } else {
+                toastr.info(
+                    'No Summaryception-hidden messages found in this chat.',
+                    'Summaryception',
+                    { timeOut: 3000 }
+                );
+            }
         } catch (e) {
             log('restore hidden error:', e);
             toastr.error('Could not restore hidden messages', 'Summaryception');
@@ -2484,6 +2524,7 @@ function bindUIEvents() {
 
     $(document).on('click', '#sc_repair', async function () {
         const { chat } = SillyTavern.getContext();
+        const store = getChatStore();
         let repaired = 0;
 
         const progressToast = toastr.info(
@@ -2494,22 +2535,42 @@ function bindUIEvents() {
 
         for (let i = 0; i < chat.length; i++) {
             const m = chat[i];
+            if (!m) continue;
 
-            const isStuckHidden = (m.is_system || m.is_hidden)
-            && !m.is_user
-            && !m.extra?.sc_ghosted
-            && m.mes
-            && m.mes.trim().length > 0;
+            // Stale ghost: flagged as summarized and hidden (is_system is the
+            // only flag ST's /hide sets), but BEYOND the summary coverage —
+            // e.g. after going back to an earlier message the store was
+            // trimmed, leaving these messages hidden with nothing covering
+            // them. Restore them to normal visible turns so the summarizer
+            // re-processes and re-hides them at the proper time.
+            const isStaleGhost = !!m.extra?.sc_ghosted
+                && !!m.is_system
+                && i > (store.summarizedUpTo ?? -1);
 
-            if (isStuckHidden) {
+            // Orphan: hidden from the LLM with no Summaryception flag and not
+            // sent by the user — hidden but never summarized, invisible to
+            // the summarizer.
+            const isStuckHidden = !!m.is_system
+                && !m.is_user
+                && !m.extra?.sc_ghosted
+                && m.mes
+                && m.mes.trim().length > 0;
+
+            if (isStaleGhost || isStuckHidden) {
                 try {
                     await SillyTavern.getContext().executeSlashCommandsWithOptions(`/unhide ${i}`, { showOutput: false });
                 } catch (e) {
                     log(`Repair: failed to unhide ${i}:`, e);
                 }
 
+                if (isStaleGhost) {
+                    delete m.extra.sc_ghosted;
+                    if (store.ghostedIndices) {
+                        store.ghostedIndices = store.ghostedIndices.filter(idx => idx !== i);
+                    }
+                }
+
                 m.is_system = false;
-                delete m.is_hidden;
 
                 repaired++;
 
@@ -2524,6 +2585,7 @@ function bindUIEvents() {
         toastr.clear(progressToast);
 
         if (repaired > 0) {
+            await saveChatStore();
             try {
                 const ctx = SillyTavern.getContext();
                 if (ctx.saveChat) await ctx.saveChat();
@@ -2532,7 +2594,7 @@ function bindUIEvents() {
             }
             updateUI();
             toastr.success(
-                `Repaired ${repaired} orphaned messages. They are now visible to the summarizer again.`,
+                `Repaired ${repaired} orphaned message${repaired === 1 ? '' : 's'}. They are now visible to the summarizer again.`,
                 'Summaryception',
                 { timeOut: 5000 }
             );
